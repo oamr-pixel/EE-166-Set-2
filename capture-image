@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+'''
+Take a picture with the Raspberry Pi's camera.
+
+Author: Mason McGill
+License: MIT
+Dependencies: clize>=4.1 numpy>=1.18 picamera>=1.13
+'''
+from pathlib import Path
+from time import sleep
+from typing import List
+
+import clize
+import numpy as np
+import picamera
+import picamera.array
+
+#------------------------------------------------------------------------------
+# Hardware-interfacing functions based on code by Richard Bowman available at
+# https://gist.github.com/rwb27/a23808e9f4008b48de95692a38ddaa08
+
+def set_analog_gain(camera: picamera.PiCamera, value: float) -> None:
+    picamera.mmal.mmal_port_parameter_set_rational(
+        camera._camera.control._port,
+        picamera.mmal.MMAL_PARAMETER_GROUP_CAMERA + 0x59,
+        picamera.mmalobj.to_rational(value))
+
+def set_digital_gain(camera: picamera.PiCamera, value: float) -> None:
+    picamera.mmal.mmal_port_parameter_set_rational(
+        camera._camera.control._port,
+        picamera.mmal.MMAL_PARAMETER_GROUP_CAMERA + 0x5A,
+        picamera.mmalobj.to_rational(value))
+
+#------------------------------------------------------------------------------
+# Exported command
+
+@clize.run
+def capture_image(dst: Path = Path('captured-image.npz'), *,
+                  mode: str = 'raw',
+                  analog_gain: float = 1.0,
+                  digital_gain: float = 1.0,
+                  red_gain: float = 1.2,
+                  blue_gain: float = 2.8,
+                  exposure: float = 33.0,
+                  n_shots: int = 1,
+                  interactive: bool = False) -> None:
+    '''
+    Take a picture with the Raspberry Pi's camera.
+
+    :param dst: The output destination (an NPZ file)
+    :param mode: 'raw', 'rgb', or 'gray'
+    :param analog_gain: The pre-quantization gain factor
+    :param digital_gain: The post-quantization gain factor
+    :param red_gain: The red channel gain factor, relative to green
+    :param blue_gain: The blue channel gain factor, relative to green
+    :param exposure: The exposure duration, in milliseconds
+    :param n_shots: The number of shots to take
+    :param interactive: Whether to wait for a keypress
+
+    The Pi camera supports exposure durations from 0.009 to 33 milliseconds.
+    To emulate longer exposures, multiple shots can be combined by specifying
+    "n-shots". If `mode=='raw'`, the data array will be a full-resolution 2D
+    array. If `mode=='rgb'`, the data array will be demosiaced by combining
+    4-pixel neighborhoods. If `mode=='gray'`, the data array will be
+    demosaiced, then converted to grayscale.
+    '''
+    # Set everything possible to "manual mode". Note: The PiCam is a bit of an
+    # intricate state machine, so be careful about reordering these settings.
+    print(f'Configuring the camera...')
+    camera = picamera.PiCamera()
+    camera.resolution = camera.MAX_RESOLUTION
+    camera.awb_mode = 'off'
+    camera.awb_gains = (red_gain, blue_gain)
+    camera.exposure_mode = 'off'
+    camera.shutter_speed = int(1000 * exposure)
+    set_analog_gain(camera, analog_gain)
+    set_digital_gain(camera, digital_gain)
+
+    # Take a breath. Getting the settings
+    # to sink in takes a hot second.
+    last_digital_gain = -1
+    while camera.digital_gain != last_digital_gain:
+        last_digital_gain = camera.digital_gain
+        sleep(0.5)
+
+    # Report the camera's parameters, which may be
+    # slightly different from those requested.
+    print(f'  Analog gain: {float(camera.analog_gain)}')
+    print(f'  Base digital gain: {float(camera.digital_gain)}')
+    print(f'  Red/green gain ratio: {float(camera.awb_gains[0])}')
+    print(f'  Blue/green gain ratio: {float(camera.awb_gains[1])}')
+    print(f'  Exposure: {camera.shutter_speed / 1000}ms')
+
+    # Provide a rich user experience.
+    camera.start_preview(fullscreen=False, window=(100, 100, 400, 300))
+    if interactive: input('Press any key to start capture.')
+
+    # Take pictures.
+    data = np.float32(0)
+    for i in range(n_shots):
+        print(f'\rCapturing shot {i+1} of {n_shots}...', end='', flush=True)
+        print('' if i < n_shots - 1 else '\n', end='', flush=True)
+        with picamera.array.PiBayerArray(camera, output_dims=2) as stream:
+            camera.capture(stream, 'jpeg', bayer=True)
+            data += stream.array
+
+    # Perform postprocessing if requested.
+    if mode in ['rgb', 'gray']:
+        print(f'Demosaicing...')
+        data = (
+            [1, 0, 0] * data[1::2, 1::2, None] +
+            [0, 1, 0] * (data[0::2, 1::2, None] + data[1::2, 0::2, None]) / 2 +
+            [0, 0, 1] * data[0::2, 0::2, None])
+    if mode == 'gray':
+        print(f'Converting to grayscale...')
+        data = 0.3 * data[..., 0] + 0.6 * data[..., 1] + 0.1 * data[..., 2]
+
+    # Write the image and the camera parameters to a NumPy archive.
+    print(f'Saving your masterpiece as "{dst}"...')
+    np.savez(
+        file = dst,
+        mode = mode,
+        n_shots = n_shots,
+        exposure = camera.shutter_speed / 1000,
+        analog_gain = float(camera.analog_gain),
+        digital_gain = float(camera.digital_gain),
+        red_gain = float(camera.awb_gains[0]),
+        blue_gain = float(camera.awb_gains[1]),
+        data = data)
+    print('Done!')
